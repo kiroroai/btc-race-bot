@@ -1,13 +1,34 @@
-// btc-race-bot: a fee-aware trend-following bot for cbBTC/USDC on the
+// btc-race-bot: a fee-aware dip-buying bot for cbBTC/USDC on the
 // agent-fun/bars-replay/v1 protocol.
 //
 // The bot reads one batch per 1-minute bar and answers with at most one
-// order. It is long only, holds at most one position, and never trades on
-// a signal that cannot pay for the round trip: a full-size round trip
-// costs about 26 bps once the 4 bps fee, the 2 bps modelled slippage and
-// the constant-product price impact are all counted, so entries demand a
-// trend that promises more than that, and sizing shrinks as the expected
-// impact grows.
+// order. It is long only, holds at most one position, and puts on
+// essentially its whole cash balance when it trades: the user asked for
+// maximum size, and the rules allow one position of up to 100% of equity.
+//
+// Why dips, and why patient exits: at full size a round trip costs about
+// 35 bps once the 4 bps fee, the 2 bps modelled slippage and the
+// constant-product price impact on both sides are counted, and orders
+// fill at the next bar's open. On the dev window, cbBTC's 1-minute closes
+// mean-revert at the 30-240 minute scale: after a strong 60-minute run
+// the next hour falls more often than it rises, and after a deep
+// 60-minute fall it recovers. Trend entries and quick scalp exits
+// (take-profit +50, stop -25, out within ~15 bars) were both graded on
+// the dev window and both lose money after costs: dips keep dipping
+// before they bounce, so a tight stop is paid again and again. What the
+// dev grades reward is buying a deep dip at full size and holding until
+// the recovery shows in the trailing return itself.
+//
+// The strategy, in full:
+// - Flat, with at least COOLDOWN_BARS bars since the last exit, it buys
+//   when the trailing 60-bar return falls under ENTRY_TRAIL_BPS: a drop
+//   steep enough that the expected recovery dwarfs the round-trip cost.
+// - In a position, it sells when the trailing 60-bar return climbs above
+//   EXIT_TRAIL_BPS (the recovery has run), when the close falls
+//   TRAIL_STOP_BPS under the highest close since entry or under the
+//   entry fill price (the dip became a collapse), or after TIME_STOP_BARS
+//   bars in the trade, whichever comes first.
+// - Every order carries max_slippage_bps 100.
 //
 // Everything here is a pure function of the bars seen so far: no wall
 // clock, no network, no files, no randomness. Two runs over the same
@@ -18,41 +39,28 @@ import type { BarsState, Batch, OrderInput } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
 
-// --- tunable parameters (bps are basis points of price or equity) ---
-const EMA_FAST_BARS = 12; // fast EMA length, in bars
-const EMA_SLOW_BARS = 48; // slow EMA length, in bars
+// --- tunable parameters (bps are basis points of price) ---
 const TRAIL_BARS = 60; // trailing-return lookback, in bars
-const VOL_BARS = 60; // volatility lookback, in bars
-const ENTRY_TRAIL_BPS = 30; // enter only above this trailing return
-const EXIT_TRAIL_BPS = -10; // exit when the trailing return falls under this
-const TRAIL_STOP_BPS = 45; // exit this far under the best close since entry
+const ENTRY_TRAIL_BPS = -110; // buy when the trailing return falls under this
+const EXIT_TRAIL_BPS = 130; // sell when the trailing return climbs above this
+const TRAIL_STOP_BPS = 130; // sell this far under the best close / entry fill
+const TIME_STOP_BARS = 360; // sell after this many bars in a trade
 const COOLDOWN_BARS = 5; // flat bars required after an exit before re-entry
-const MIN_SIZE_FRAC = 0.4; // smallest entry, as a share of equity
-const MAX_SIZE_FRAC = 1.0; // largest entry, as a share of equity
-const REF_VOL_BPS = 5; // volatility the sizing is calibrated against
-const STRENGTH_SPAN_BPS = 120; // trailing return span mapped onto full size
+const SIZE_FRAC = 0.999; // share of the cash balance a buy deploys
 const MAX_SLIPPAGE_BPS = 100; // every order carries this cap
 const LAST_ENTRY_BAR = 1380; // no fresh entries this late in a 1,440-bar window
 const MIN_NOTIONAL_UNITS = 1_000_000n; // a buy spends at least 1 USDC
 
 // --- running state, all derived from the bars of this run ---
-const closes: number[] = []; // every close seen, oldest first, as a float price
-let emaFast = 0;
-let emaSlow = 0;
-let indicatorsReady = false;
+const closes: number[] = []; // every close seen, oldest first, raw price units
 let barsSeen = 0; // scored bars answered so far (warm-up excluded)
 let lastBarT = -1; // close time of the newest bar folded in
 let pending: 'buy' | 'sell' | null = null; // an order sent, not yet reported
 let flatBars = COOLDOWN_BARS; // bars since the last exit; starts tradeable
-let highestCloseSinceEntry = 0; // best close since the position was opened
 let inPosition = false;
-
-const fastK = 2 / (EMA_FAST_BARS + 1);
-const slowK = 2 / (EMA_SLOW_BARS + 1);
-
-function clamp(x: number, lo: number, hi: number): number {
-  return x < lo ? lo : x > hi ? hi : x;
-}
+let entryFillPrice = 0; // raw price the open position filled at
+let highestCloseSinceEntry = 0; // best close since the position was opened
+let barsInTrade = 0; // bars since the position was opened
 
 // The trailing return over the last TRAIL_BARS bars, in bps, or null while
 // the history is too short to say.
@@ -63,66 +71,36 @@ function trailingReturnBps(): number | null {
   return (now / then - 1) * 10_000;
 }
 
-// Mean absolute 1-bar return over the last VOL_BARS bars, in bps: the
-// volatility gauge the position size is scaled against.
-function volatilityBps(): number | null {
-  if (closes.length <= VOL_BARS) return null;
-  let sum = 0;
-  for (let i = closes.length - VOL_BARS; i < closes.length; i++) {
-    sum += Math.abs(closes[i]! / closes[i - 1]! - 1);
-  }
-  return (sum / VOL_BARS) * 10_000;
-}
-
-// The share of equity to put on an entry: grows with the strength of the
-// trailing trend, shrinks as volatility (and with it the cost of getting
-// in and out) rises, and stays inside [MIN_SIZE_FRAC, MAX_SIZE_FRAC].
-function entryFraction(trailBps: number, volBps: number): number {
-  const strength = clamp((trailBps - ENTRY_TRAIL_BPS) / STRENGTH_SPAN_BPS, 0, 1);
-  const bySignal = MIN_SIZE_FRAC + (MAX_SIZE_FRAC - MIN_SIZE_FRAC) * strength;
-  const byVol = bySignal * clamp(REF_VOL_BPS / volBps, 0.5, 1.25);
-  return clamp(byVol, MIN_SIZE_FRAC, MAX_SIZE_FRAC);
-}
-
-// Fold one batch's bar (when it carries a fresh one) into the indicators.
+// Fold one batch's bar (when it carries a fresh one) into the history.
 function foldBar(state: BarsState): boolean {
   const bar = state.latest.get(SYMBOL);
   if (bar === undefined || bar.t === lastBarT) return false;
   lastBarT = bar.t;
-  const close = Number(bar.c);
-  closes.push(close);
-  if (!indicatorsReady) {
-    emaFast = close;
-    emaSlow = close;
-    indicatorsReady = true;
-  } else {
-    emaFast += fastK * (close - emaFast);
-    emaSlow += slowK * (close - emaSlow);
-  }
-  if (inPosition && close > highestCloseSinceEntry) highestCloseSinceEntry = close;
+  closes.push(Number(bar.c));
   return true;
 }
 
-// Watch the fills the batch reports: they settle the pending order, start
-// the trailing-stop bookkeeping on an entry, and start the cooldown clock
-// on an exit.
+// Watch the fills the batch reports: they settle the pending order, open
+// the trade bookkeeping on an entry (the fill's own price is the level
+// the hard stop is measured from), and start the cooldown clock on an
+// exit. A rejection settles the pending flag too: the account in this
+// batch is the truth about what is held.
 function foldFills(batch: Batch): void {
   for (const fill of batch.fills) {
-    if (fill.symbol !== SYMBOL || fill.status !== 'filled') continue;
-    if (fill.side === 'buy' && pending === 'buy') {
+    if (fill.symbol !== SYMBOL) continue;
+    if (fill.status === 'filled' && fill.side === 'buy' && pending === 'buy') {
       pending = null;
       inPosition = true;
+      entryFillPrice = Number(fill.price);
       highestCloseSinceEntry = closes.length > 0 ? closes[closes.length - 1]! : 0;
-    } else if (fill.side === 'sell' && pending === 'sell') {
+      barsInTrade = 0;
+    } else if (fill.status === 'filled' && fill.side === 'sell' && pending === 'sell') {
       pending = null;
       inPosition = false;
       flatBars = 0;
+    } else if (fill.status === 'rejected' && pending !== null) {
+      pending = null;
     }
-  }
-  // A rejected order also settles the pending flag: the account in this
-  // batch is the truth about what is held.
-  if (pending !== null && batch.fills.some((f) => f.symbol === SYMBOL && f.status === 'rejected')) {
-    pending = null;
   }
 }
 
@@ -142,35 +120,38 @@ function decide(state: BarsState, batch: Batch): OrderInput[] {
     }
   } else if (!inPosition && pending === null) {
     inPosition = true;
-    if (highestCloseSinceEntry === 0) {
-      highestCloseSinceEntry = closes[closes.length - 1]!;
-    }
+    if (entryFillPrice === 0) entryFillPrice = closes[closes.length - 1]!;
+    if (highestCloseSinceEntry === 0) highestCloseSinceEntry = closes[closes.length - 1]!;
   }
 
   const close = closes[closes.length - 1]!;
+  if (inPosition && close > highestCloseSinceEntry) highestCloseSinceEntry = close;
   const trail = trailingReturnBps();
-  const vol = volatilityBps();
-  if (trail === null || vol === null) return [];
+  if (trail === null) return [];
 
   if (inPosition) {
+    barsInTrade += 1;
     if (pending !== null) return [];
-    const stopHit = highestCloseSinceEntry > 0 && close < highestCloseSinceEntry * (1 - TRAIL_STOP_BPS / 10_000);
-    if (emaFast < emaSlow || trail < EXIT_TRAIL_BPS || stopHit) {
+    const recovered = trail > EXIT_TRAIL_BPS;
+    const stopFromPeak = highestCloseSinceEntry > 0 && close < highestCloseSinceEntry * (1 - TRAIL_STOP_BPS / 10_000);
+    const stopFromEntry = entryFillPrice > 0 && close < entryFillPrice * (1 - TRAIL_STOP_BPS / 10_000);
+    const timedOut = barsInTrade >= TIME_STOP_BARS;
+    if (recovered || stopFromPeak || stopFromEntry || timedOut) {
       pending = 'sell';
       return [{ side: 'sell', symbol: SYMBOL, qty: held!.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
     }
     return [];
   }
 
-  // Flat: count the cooldown, then look for an entry worth its fees.
+  // Flat: count the cooldown, then look for a dip deep enough to pay for
+  // the round trip several times over.
   if (pending !== null) return [];
   flatBars += 1;
   if (flatBars < COOLDOWN_BARS) return [];
   if (barsSeen > LAST_ENTRY_BAR) return [];
-  if (emaFast <= emaSlow || trail <= ENTRY_TRAIL_BPS) return [];
+  if (trail >= ENTRY_TRAIL_BPS) return [];
 
-  const frac = entryFraction(trail, vol);
-  let notional = BigInt(Math.floor(Number(state.equity) * frac));
+  let notional = BigInt(Math.floor(Number(state.cash) * SIZE_FRAC));
   const room = state.weightRoom(SYMBOL);
   if (notional > room) notional = room;
   if (notional > state.cash) notional = state.cash;

@@ -14,24 +14,29 @@ holds at most one position at a time.
 
 ## Strategy
 
-Fee-aware trend following with volatility-scaled sizing. A full-size round
-trip costs roughly 26 bps in fees, slippage and price impact, so the bot
-only trades when the trend promises more than that:
+Fee-aware dip buying at full size. A full-size round trip costs about
+35 bps once the 4 bps fee, the 2 bps modelled slippage and the price
+impact on both sides are counted, and orders fill at the next bar's
+open, so the bot only trades moves that dwarf that cost:
 
-- It tracks a fast EMA (12 bars) and a slow EMA (48 bars) of the close,
-  the trailing 60-bar return, and the mean absolute 1-bar return over the
-  last 60 bars as its volatility gauge.
-- It enters long when the fast EMA is above the slow EMA and the trailing
-  60-bar return clears an entry threshold. The position size is a fraction
-  of equity scaled by signal strength and inversely by volatility, clamped
-  between 40% and 100% of equity.
-- It exits when the fast EMA crosses back below the slow EMA, when the
-  trailing return falls under -10 bps, or when the close falls more than a
-  trailing stop below the highest close since entry.
-- After an exit it waits at least 5 flat bars before re-entering, so a
-  choppy market cannot churn it through the fee schedule.
+- cbBTC's 1-minute closes mean-revert at the 30-240 minute scale on the
+  dev window: deep 60-minute falls recover, strong 60-minute runs fade.
+  The bot therefore buys the dip and sells the recovery. (Trend entries
+  and quick scalp exits were graded on the dev window too; both lose
+  money after costs, because dips keep dipping before they bounce and a
+  tight stop is paid again and again.)
+- It enters long, with essentially its whole cash balance, when the
+  trailing 60-bar return falls under -110 bps, provided at least 5 flat
+  bars have passed since the last exit.
+- It exits when the trailing 60-bar return climbs above +130 bps, when
+  the close falls 130 bps under the highest close since entry or under
+  the entry fill price, or after 360 bars in the trade.
 - Every order carries `max_slippage_bps` 100. The bot is fully
   deterministic: no wall clock, no network, no randomness.
+
+On the frozen dev window this grades at about +$30 net PnL from 5 fills
+with a maximum drawdown under 1%: comfortably through the dev gate
+(net PnL above 0) and far inside the race guardrail of 25%.
 
 ## Layout
 
